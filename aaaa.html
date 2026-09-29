@@ -1,0 +1,1904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UNDERGROUND ADVENTURE - Retro Digging Arcade</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;color:#fff;font-family:"Courier New",monospace;}
+  body{display:flex;flex-direction:column;align-items:center;min-height:100vh;}
+  #wrap{display:flex;gap:18px;align-items:flex-start;padding:14px;flex-wrap:wrap;justify-content:center;}
+  canvas{background:#000;image-rendering:pixelated;image-rendering:crisp-edges;border:4px solid #444;box-shadow:0 0 0 4px #111,0 0 24px #0af3;}
+  .panel{width:250px;border:4px solid #444;background:#060606;padding:10px 12px;font-size:12px;line-height:1.6;color:#9ad;}
+  .panel h2{color:#ff3; font-size:13px;margin:6px 0;letter-spacing:2px;}
+  .panel b{color:#fff}
+  .k{display:inline-block;background:#222;border:2px solid #555;padding:0 5px;color:#ff3;margin:1px}
+  footer{color:#555;font-size:11px;padding:6px 0 18px;text-align:center}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="624" height="576"></canvas>
+  <div class="panel">
+    <h2>CONTROLS</h2>
+    <div><span class="k">↑↓←→</span> / <span class="k">W A S D</span><br><b>MOVE + DIG</b> (walking into soil digs it)</div>
+    <div><span class="k">SPACE</span> <b>THROW BALL</b> — hold a direction to aim (8-way). A monster in your aim cone gets a <b>LOCK</b> bracket and the ball homes onto it.</div>
+    <div><span class="k">P</span> PAUSE &nbsp; <span class="k">M</span> MUSIC &nbsp; <span class="k">H</span> RANKING</div>
+    <div><span class="k">ENTER</span> START / PLAY AGAIN &nbsp; <span class="k">N</span> CHANGE NAME</div>
+    <div style="color:#6a8">Your name is asked only the first time and then remembered — later runs start instantly with ENTER, and the ranking only opens when you press <span class="k">H</span>.</div>
+    <h2>FIELD MANUAL</h2>
+    <div>
+      <b>SOIL</b> diggable by the PLAYER ONLY.<br>
+      <b>MONSTERS</b> can never dig - they follow open tunnels.<br>
+      <b>ROCKS</b> block everything and fall when unsupported. Crush a monster for bonus points.<br>
+      <b>MONSTER MACHINE</b> builds 5 monsters one by one. When the 5th crawls out the machine breaks and morphs — flash + zoom — into <b>CHEESE</b>. Snatch it!
+    </div>
+    <h2>SCORE</h2>
+    <div>CHERRY 100 · APPLE 200<br>ORANGE 300 · GRAPE 500<br><b>ANY MONSTER = 500</b><br>ROCK CRUSH +250 extra<br>CHEESE +1500<br>WIPEOUT BONUS +3000<br>SURVIVE BONUS +1000</div>
+    <div style="color:#6a8"><b>EVERY</b> playthrough is recorded and ranked. The final result + TOP 10 appear automatically after each game; press <span class="k">H</span> any time to review.</div>
+    <h2>CHEESE ALERT</h2>
+    <div>Eating the cheese freezes the old monsters and calls <b>3 NEW FAST MONSTERS</b>. You then have <b>8 SECONDS</b>. Defeat <b>every</b> monster and the round ends instantly with a big bonus. The cavern changes colour!</div>
+  </div>
+</div>
+<footer>UNDERGROUND ADVENTURE — original pixel art &amp; code, inspired by 1982 arcade digging games. No original ROM assets used.</footer>
+
+<script>
+/* ============================================================
+   UNDERGROUND ADVENTURE
+   Single-file HTML5 Canvas arcade digging game.
+   ============================================================ */
+
+/* ---------- FIREBASE (placeholder config - safe if unfilled) ---------- */
+const firebaseConfig = {
+  apiKey: "AIzaSyDMTToPyAYQdpftHHokIx4jLENC-2DPGVU",
+  authDomain: "canvas-digging-game.firebaseapp.com",
+  databaseURL: "https://canvas-digging-game-default-rtdb.firebaseio.com",
+  projectId: "canvas-digging-game",
+  storageBucket: "canvas-digging-game.firebasestorage.app",
+  messagingSenderId: "1099437958104",
+  appId: "1:1099437958104:web:1d3db9025de05bc2d648ad",
+  measurementId: "G-VK5VXZ10PG"
+};
+
+const FB = { ready:false, app:null, db:null, mod:null };
+
+async function initFirebase(){
+  if(firebaseConfig.apiKey.indexOf("YOUR_")===0){ console.log("[Firebase] Not configured - using local leaderboard."); return; }
+  try{
+    const appMod = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
+    const dbMod  = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js");
+    FB.app = appMod.initializeApp(firebaseConfig);
+    FB.db  = dbMod.getDatabase(FB.app);
+    FB.mod = dbMod; FB.ready = true;
+    console.log("[Firebase] Ready.");
+  }catch(e){ console.warn("[Firebase] init failed, local leaderboard used.", e); }
+}
+initFirebase();
+
+/* ============================================================
+   MATCH RECORDS
+   EVERY playthrough is recorded - nothing is discarded. The full
+   history is kept locally (and pushed to Firebase when configured);
+   the ranking is then computed across ALL recorded matches.
+   ============================================================ */
+const HIST_KEY = "ua_history";
+let lastRecordId = 0;
+let allRecords = [];              // every match ever played
+let rankStats = null;             // summary shown on the result screen
+
+function readHistory(){
+  try{ const a=JSON.parse(localStorage.getItem(HIST_KEY)||"[]"); return Array.isArray(a)?a:[]; }
+  catch(e){ return []; }
+}
+function writeHistory(arr){
+  try{ localStorage.setItem(HIST_KEY, JSON.stringify(arr.slice(-500))); }catch(e){}
+}
+function sortRecords(a,b){ return b.score-a.score || a.ts-b.ts; }
+
+/* Save one finished match. Returns the record. */
+async function saveScore(name, score, stage){
+  lastRecordId = Date.now();
+  const hist = readHistory();
+  const rec = {
+    no: hist.length+1,                               // match number
+    name:(name||"PLAYER").toUpperCase().slice(0,8),
+    score: score|0, stage: stage|0,
+    kills: matchKills|0, fruit: matchFruit|0,
+    time: Math.max(0, Math.floor((Date.now()-matchStart)/1000)),
+    ts: lastRecordId
+  };
+  hist.push(rec);                                    // keep EVERY score
+  writeHistory(hist);
+  if(FB.ready){
+    try{ await FB.mod.push(FB.mod.ref(FB.db,"scores"), rec); }
+    catch(e){ console.warn("[Firebase] save failed",e); }
+  }
+  return rec;
+}
+
+/* Load every record (remote if available, always merged with local). */
+async function loadAllRecords(){
+  let remote=[];
+  if(FB.ready){
+    try{
+      const snap = await FB.mod.get(FB.mod.ref(FB.db,"scores"));
+      snap.forEach(c=>remote.push(c.val()));
+    }catch(e){ console.warn("[Firebase] load failed",e); }
+  }
+  const local = readHistory();
+  const seen = new Set(), merged=[];
+  for(const r of remote.concat(local)){
+    if(!r) continue;
+    const key = r.ts+"_"+r.score+"_"+(r.name||"");
+    if(seen.has(key)) continue;
+    seen.add(key); merged.push(r);
+  }
+  merged.sort(sortRecords);
+  allRecords = merged;
+  return merged;
+}
+/* Top 10 of all recorded matches. */
+async function loadScores(){
+  const all = await loadAllRecords();
+  return all.slice(0,10);
+}
+/* Summary of the whole history for the result screen. */
+function buildRankStats(){
+  const all = allRecords;
+  const total = all.length;
+  let rank = 0;
+  for(let i=0;i<all.length;i++) if(all[i].ts===lastRecordId){ rank=i+1; break; }
+  const mine = all.filter(r=>r.name===(playerName||"PLAYER"));
+  const best = all.length? all[0].score : 0;
+  const myBest = mine.length? Math.max(...mine.map(r=>r.score)) : 0;
+  const avg = mine.length? Math.round(mine.reduce((s,r)=>s+r.score,0)/mine.length) : 0;
+  return { total, rank, best, myBest, avg, myGames: mine.length };
+}
+
+/* ---------- CANVAS / CONSTANTS ---------- */
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const TS = 48;                 // tile size (big chunky arcade bricks)
+const COLS = 13, ROWS = 10;    // smaller, denser grid 13 x 10
+const HUD_H = 64;
+const FIELD_W = COLS*TS, FIELD_H = ROWS*TS;   // 624 x 480
+const SPR = 3;                 // sprite pixel scale (16 * 3 = 48 = one tile)
+const HALF = TS/2;
+const FIELD_Y = HUD_H;
+
+const T_OPEN=0, T_SOIL=1, T_ROCK=2, T_FRUIT=3, T_CHEESE=4, T_NEST=5;
+
+/* ---------- SCORING RULES ---------- */
+const KILL_POINTS   = 500;   // every monster defeated = 500 points
+const ROCK_BONUS    = 250;   // extra for a rock crush
+const CHEESE_POINTS = 1500;
+const CHEESE_TIME   = 8*60;  // cheese finale lasts 8 seconds
+const WIPEOUT_BONUS = 3000;  // clearing every monster in the finale
+const SURVIVE_BONUS = 1000;
+
+const FRUIT_KINDS = [
+  {id:0,name:"CHERRY",pts:100},
+  {id:1,name:"APPLE" ,pts:200},
+  {id:2,name:"ORANGE",pts:300},
+  {id:3,name:"GRAPE" ,pts:500}
+];
+
+/* ---------- GAME STATES ---------- */
+const S_START="START", S_NAME="NAME", S_PLAY="PLAYING", S_PAUSE="PAUSED",
+      S_CLEAR="STAGE_CLEAR", S_OVER="GAME_OVER", S_HIGH="HIGH_SCORE";
+let state = S_START;
+let prevStateForHigh = S_START;
+
+/* ---------- GLOBAL GAME VARS ---------- */
+let map=[], fruitKind=[];      // fruitKind parallel grid (which fruit in a T_FRUIT tile)
+let player, enemies=[], ball=null, fallingRocks=[], popups=[], particles=[];
+let score=0, highScore=Number(localStorage.getItem("ua_high")||0), lives=3, stage=1;
+let fruitTotal=0, fruitGot=0, enemyKills=0, killGoal=0;
+let matchKills=0, matchFruit=0, matchStart=0;   // per-match stats for the leaderboard
+/* The name is asked ONCE and then remembered, so later games start instantly. */
+let playerName = (localStorage.getItem("ua_name")||"").toUpperCase();
+let nameBuffer = "";
+function rememberName(n){
+  playerName = (n||"PLAYER").toUpperCase().slice(0,8);
+  try{ localStorage.setItem("ua_name", playerName); }catch(e){}
+}
+let nest = {x:0,y:0, monsterLeft:false, cheese:false};
+let machine = {x:0,y:0,total:5,made:0,timer:0,interval:170,charge:0,flash:0,active:false,broken:false,anim:0};
+let cheeseBirth=0, cheeseBirthT=0;   // cheese flash / zoom-in birth animation
+let screenFlash=0, shake=0;
+let cheeseEaten=false, alertPhase=false, alertTimer=0, freezeTimer=0;
+let paletteMode=0;             // 0 = normal soil, 1 = cheese-alert palette
+let stageMsgTimer=0, deathTimer=0, readyTimer=0;
+let rankList=[], rankLoading=false;
+let frame=0;
+
+/* ---------- PALETTES ---------- */
+const PALETTES = [
+  { soilA:"#8a4a1c", soilB:"#a75c26", soilDot:"#5e3011", tunnel:"#000000",
+    grid:"#141414", border:"#e8b23c", hud:"#39f", sky:"#1a0e06" },
+  { soilA:"#4b2470", soilB:"#6c37a0", soilDot:"#2b1245", tunnel:"#070014",
+    grid:"#160a22", border:"#ff5ce0", hud:"#f6f", sky:"#12031e" }
+];
+function PAL(){ return PALETTES[paletteMode]; }
+
+/* ============================================================
+   AUDIO — WebAudio 8bit SFX + cheerful looping chiptune
+   ============================================================ */
+const Audio8 = (function(){
+  let actx=null, master=null, musicGain=null, sfxGain=null;
+  let musicOn=true, playing=false, timer=null, step=0, nextTime=0;
+  const BPM=168, STEP=15/BPM; // 16th notes
+
+  function ensure(){
+    if(actx) return actx;
+    try{
+      actx = new (window.AudioContext||window.webkitAudioContext)();
+      master=actx.createGain(); master.gain.value=0.6; master.connect(actx.destination);
+      musicGain=actx.createGain(); musicGain.gain.value=0.28; musicGain.connect(master);
+      sfxGain=actx.createGain(); sfxGain.gain.value=0.5; sfxGain.connect(master);
+    }catch(e){ console.warn("audio unavailable",e); }
+    return actx;
+  }
+  function resume(){ ensure(); if(actx && actx.state==="suspended") actx.resume(); }
+
+  function blip(freq, dur, type, vol, dest, t0, slideTo){
+    if(!actx) return;
+    const t = t0!==undefined ? t0 : actx.currentTime;
+    const o=actx.createOscillator(), g=actx.createGain();
+    o.type=type||"square"; o.frequency.setValueAtTime(freq,t);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30,slideTo), t+dur);
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(vol||0.25, t+0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+    o.connect(g); g.connect(dest||sfxGain); o.start(t); o.stop(t+dur+0.02);
+  }
+  function noise(dur, vol, t0, dest){
+    if(!actx) return;
+    const t=t0!==undefined?t0:actx.currentTime;
+    const len=Math.floor(actx.sampleRate*dur);
+    const buf=actx.createBuffer(1,len,actx.sampleRate), d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*(1-i/len);
+    const s=actx.createBufferSource(); s.buffer=buf;
+    const g=actx.createGain(); g.gain.value=vol||0.2;
+    s.connect(g); g.connect(dest||sfxGain); s.start(t);
+  }
+
+  /* ---- Sound effects ---- */
+  const sfx = {
+    dig(){ resume(); if(!actx)return; noise(0.05,0.12); blip(220,0.05,"square",0.08,undefined,undefined,150); },
+    fruit(){ resume(); if(!actx)return; const t=actx.currentTime;
+      [660,880,1320].forEach((f,i)=>blip(f,0.09,"square",0.22,undefined,t+i*0.05)); },
+    cheese(){ resume(); if(!actx)return; const t=actx.currentTime;
+      [523,659,784,1047,1319,1568].forEach((f,i)=>blip(f,0.13,"square",0.26,undefined,t+i*0.07));
+      [0,1,2].forEach(i=>blip(131*(i+1),0.4,"triangle",0.18,undefined,t+i*0.07)); },
+    bonus1500(){ resume(); if(!actx)return; const t=actx.currentTime;
+      for(let i=0;i<10;i++) blip(400+i*120,0.06,"square",0.18,undefined,t+i*0.04); },
+    throwBall(){ resume(); if(!actx)return; blip(900,0.14,"square",0.2,undefined,undefined,260); },
+    bounce(){ resume(); if(!actx)return; blip(520,0.05,"square",0.12,undefined,undefined,760); },
+    kill(){ resume(); if(!actx)return; const t=actx.currentTime;
+      blip(500,0.2,"sawtooth",0.24,undefined,t,80); noise(0.2,0.2,t); },
+    enemyAppear(){ resume(); if(!actx)return; const t=actx.currentTime;
+      blip(150,0.25,"sawtooth",0.2,undefined,t,600); blip(300,0.3,"square",0.14,undefined,t+0.1,900); },
+    rock(){ resume(); if(!actx)return; const t=actx.currentTime;
+      noise(0.3,0.26,t); blip(120,0.3,"triangle",0.2,undefined,t,45); },
+    death(){ resume(); if(!actx)return; const t=actx.currentTime;
+      [740,620,520,440,330,220,150].forEach((f,i)=>blip(f,0.18,"square",0.25,undefined,t+i*0.11)); },
+    clear(){ resume(); if(!actx)return; const t=actx.currentTime;
+      [523,659,784,1047,784,1047,1319].forEach((f,i)=>blip(f,0.16,"square",0.26,undefined,t+i*0.12)); },
+    alert(){ resume(); if(!actx)return; const t=actx.currentTime;
+      for(let i=0;i<6;i++){ blip(880,0.08,"square",0.22,undefined,t+i*0.16); blip(1180,0.08,"square",0.2,undefined,t+i*0.16+0.08); } },
+    tick(){ resume(); if(!actx)return; blip(1400,0.05,"square",0.18); },
+    menu(){ resume(); if(!actx)return; blip(660,0.07,"square",0.2); }
+  };
+
+  /* ---- Cheerful chiptune loop (playful 1980s arcade style) ---- */
+  // note names -> freq
+  function n(name){
+    if(name===0) return 0;
+    const m={C:0,"C#":1,D:2,"D#":3,E:4,F:5,"F#":6,G:7,"G#":8,A:9,"A#":10,B:11};
+    const pitch=name.slice(0,-1), oct=parseInt(name.slice(-1),10);
+    return 440*Math.pow(2,(m[pitch]+(oct-4)*12-9)/12);
+  }
+  const L=[ // 32-step bouncy lead (2 bars), repeated with variation
+    "C5",0,"E5",0,"G5",0,"E5",0,"A5",0,"G5",0,"E5",0,"C5",0,
+    "D5",0,"F5",0,"A5",0,"F5",0,"G5",0,"B4",0,"D5","D5",0,0
+  ];
+  const L2=[
+    "E5",0,"G5",0,"C6",0,"G5",0,"F5",0,"A5",0,"C6",0,"A5",0,
+    "G5","A5","G5","F5","E5",0,"D5",0,"C5",0,"E5",0,"G5",0,0,0
+  ];
+  const B=[ // bass
+    "C3",0,"C3",0,"G2",0,"C3",0,"A2",0,"A2",0,"E2",0,"A2",0,
+    "F2",0,"F2",0,"C3",0,"F2",0,"G2",0,"G2",0,"B2",0,"G2",0
+  ];
+  const HAT=[1,0,1,0,1,0,1,1,1,0,1,0,1,0,1,1,1,0,1,0,1,0,1,1,1,0,1,0,1,1,1,1];
+
+  function schedule(){
+    if(!actx) return;
+    while(nextTime < actx.currentTime + 0.25){
+      const bar = Math.floor(step/32)%2;
+      const i = step%32;
+      const lead = (bar===0?L:L2)[i];
+      if(lead){ blip(n(lead)*(alertPhase?1.25:1), STEP*1.7, "square", 0.22, musicGain, nextTime); }
+      const bass = B[i];
+      if(bass){ blip(n(bass)*(alertPhase?1.25:1), STEP*1.6, "triangle", 0.30, musicGain, nextTime); }
+      if(HAT[i]) noise(0.03,0.07,nextTime,musicGain);
+      if(i%8===0) noise(0.09,0.16,nextTime,musicGain); // kick-ish
+      step=(step+1)%64;
+      nextTime += STEP*(alertPhase?0.78:1);
+    }
+  }
+  function start(){
+    ensure(); resume();
+    if(!actx || playing || !musicOn) return;
+    playing=true; step=0; nextTime=actx.currentTime+0.08;
+    timer=setInterval(schedule,40);
+  }
+  function stop(){ playing=false; if(timer){clearInterval(timer); timer=null;} }
+  function toggle(){ musicOn=!musicOn; if(musicOn) start(); else stop(); return musicOn; }
+  return { sfx, start, stop, toggle, resume, ensure, isOn:()=>musicOn };
+})();
+
+/* ============================================================
+   PIXEL SPRITE HELPERS
+   ============================================================ */
+function drawSprite(rows, pal, x, y, scale){
+  for(let r=0;r<rows.length;r++){
+    const line=rows[r];
+    for(let c=0;c<line.length;c++){
+      const ch=line[c];
+      if(ch==="." || ch===" ") continue;
+      const col=pal[ch]; if(!col) continue;
+      ctx.fillStyle=col;
+      ctx.fillRect(x+c*scale, y+r*scale, scale, scale);
+    }
+  }
+}
+
+/* ---- PLAYER: original clown/miner, red & white outfit ---- */
+const SPR_PLAYER = [
+  "......RRRR......",
+  ".....RRRRRR.....",
+  "....RRRRRRRR....",
+  "...WWWWWWWWWW...",
+  "....SSSSSSSS....",
+  "...SSKSSSSKSS...",
+  "...SSSSSSSSSS...",
+  "....SSKKKKSS....",
+  ".....SSSSSS.....",
+  "...WWRRRRRRWW...",
+  "..WWRRWWWWRRWW..",
+  "..WWRRWWWWRRWW..",
+  "...RRRRRRRRRR...",
+  "...RRRR..RRRR...",
+  "...KKK....KKK...",
+  "..KKKK....KKKK.."
+];
+const PAL_PLAYER = {R:"#e8302a",W:"#ffffff",S:"#ffc99a",K:"#2a1a10"};
+const PAL_PLAYER_ALT = {R:"#ff5a52",W:"#ffffff",S:"#ffc99a",K:"#2a1a10"};
+
+/* ---- ENEMY A : slow blob monster ---- */
+const SPR_ENEMY_A = [
+  "....G......G....",
+  "....GG....GG....",
+  "...GGGGGGGGGG...",
+  "..GGGGGGGGGGGG..",
+  ".GGWWGGGGGGWWGG.",
+  ".GGWKGGGGGGWKGG.",
+  ".GGGGGGGGGGGGGG.",
+  ".GGGGKKKKKKGGGG.",
+  ".GGGKWWWWWWKGGG.",
+  ".GGGKWWWWWWKGGG.",
+  ".GGGGKKKKKKGGGG.",
+  "..GGGGGGGGGGGG..",
+  "..GGGGGGGGGGGG..",
+  "...GG.GG.GG.GG..",
+  "..GGG.GGG.GGG...",
+  ".................."
+];
+const PAL_A = {G:"#38c23c",W:"#ffffff",K:"#101010"};
+/* ---- ENEMY B : faster spiky monster ---- */
+const SPR_ENEMY_B = [
+  ".......PP.......",
+  "..P...PPPP...P..",
+  "..PP.PPPPPP.PP..",
+  "...PPPPPPPPPP...",
+  "..PPPPPPPPPPPP..",
+  ".PPYYPPPPPPYYPP.",
+  ".PPYKPPPPPPYKPP.",
+  ".PPPPPPPPPPPPPP.",
+  ".PPPKKKKKKKKPPP.",
+  ".PPPKYYYYYYKPPP.",
+  ".PPPPKKKKKKPPPP.",
+  "..PPPPPPPPPPPP..",
+  "...PPPPPPPPPP...",
+  "..PP.PP..PP.PP..",
+  ".PP..PP..PP..PP.",
+  "................"
+];
+const PAL_B = {P:"#ff3fa4",Y:"#ffe14d",K:"#140010"};
+/* ---- ALERT MONSTERS (three different, very fast) ---- */
+const SPR_X1 = [ // cyan bolt
+  "....C........C..",
+  "....CC......CC..",
+  "...CCCCCCCCCC...",
+  "..CCCCCCCCCCCC..",
+  ".CCKKCCCCCCKKCC.",
+  ".CCKWCCCCCCKWCC.",
+  ".CCCCCCCCCCCCCC.",
+  ".CCCCWWWWWWCCCC.",
+  ".CCCWKKKKKKWCCC.",
+  ".CCCCWWWWWWCCCC.",
+  "..CCCCCCCCCCCC..",
+  "..CC.CCCCCC.CC..",
+  ".CC...CCCC...CC.",
+  "..C..CC..CC..C..",
+  "....CC....CC....",
+  "................"
+];
+const PAL_X1={C:"#2ff0ff",W:"#ffffff",K:"#062033"};
+const SPR_X2 = [ // orange horned
+  "..O..........O..",
+  "..OO........OO..",
+  "..OOO.OOOO.OOO..",
+  "...OOOOOOOOOO...",
+  "..OOOOOOOOOOOO..",
+  ".OOKKOOOOOOKKOO.",
+  ".OOKWOOOOOOKWOO.",
+  ".OOOOOOOOOOOOOO.",
+  ".OOKKKKKKKKKKOO.",
+  ".OOKWKWKWKWKKOO.",
+  ".OOOKKKKKKKKOOO.",
+  "..OOOOOOOOOOOO..",
+  "...OOOOOOOOOO...",
+  "..OO..OOOO..OO..",
+  ".OOO..O..O..OOO.",
+  "................"
+];
+const PAL_X2={O:"#ff8a1f",W:"#ffffff",K:"#301000"};
+const SPR_X3 = [ // violet ghost
+  ".....VVVVVV.....",
+  "...VVVVVVVVVV...",
+  "..VVVVVVVVVVVV..",
+  ".VVVWWVVVVWWVVV.",
+  ".VVVWKVVVVWKVVV.",
+  ".VVVWWVVVVWWVVV.",
+  "VVVVVVVVVVVVVVVV",
+  "VVVVVKKKKKKVVVVV",
+  "VVVVKWWWWWWKVVVV",
+  "VVVVVKKKKKKVVVVV",
+  "VVVVVVVVVVVVVVVV",
+  "VVVVVVVVVVVVVVVV",
+  "VVVVVVVVVVVVVVVV",
+  "VV.VVV.VVV.VVV.V",
+  "V...V...V...V...",
+  "................"
+];
+const PAL_X3={V:"#b45cff",W:"#ffffff",K:"#1a0030"};
+
+const ENEMY_TYPES = {
+  A:{spr:SPR_ENEMY_A,pal:PAL_A,speed:1.05,pts:500},
+  B:{spr:SPR_ENEMY_B,pal:PAL_B,speed:1.55,pts:1000},
+  X1:{spr:SPR_X1,pal:PAL_X1,speed:2.35,pts:1500},
+  X2:{spr:SPR_X2,pal:PAL_X2,speed:2.2,pts:1500},
+  X3:{spr:SPR_X3,pal:PAL_X3,speed:2.5,pts:1500}
+};
+
+/* ---- Fruits, rock, cheese drawn procedurally (pixel blocks) ---- */
+function pxRect(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(x,y,w,h); }
+function drawFruit(kind,x,y){
+  const s=3, ox=x+3, oy=y+3; // 14*3 = 42 within a 48px tile
+  if(kind===0){ // CHERRY
+    pxRect(ox+6*s,oy+1*s,1*s,4*s,"#2f9a2f"); pxRect(ox+7*s,oy+0*s,3*s,1*s,"#2f9a2f");
+    pxRect(ox+10*s,oy+1*s,1*s,3*s,"#2f9a2f");
+    pxRect(ox+2*s,oy+6*s,5*s,5*s,"#e01f2a"); pxRect(ox+3*s,oy+5*s,3*s,1*s,"#e01f2a");
+    pxRect(ox+3*s,oy+7*s,1*s,1*s,"#ff9a9a");
+    pxRect(ox+8*s,oy+7*s,5*s,5*s,"#b8151f"); pxRect(ox+9*s,oy+6*s,3*s,1*s,"#b8151f");
+    pxRect(ox+9*s,oy+8*s,1*s,1*s,"#ff9a9a");
+  } else if(kind===1){ // APPLE
+    pxRect(ox+6*s,oy+1*s,1*s,3*s,"#7a4a12"); pxRect(ox+7*s,oy+1*s,3*s,1*s,"#3fbf3f");
+    pxRect(ox+3*s,oy+4*s,8*s,7*s,"#25d02f"); pxRect(ox+2*s,oy+5*s,10*s,5*s,"#25d02f");
+    pxRect(ox+3*s,oy+11*s,3*s,1*s,"#25d02f"); pxRect(ox+8*s,oy+11*s,3*s,1*s,"#25d02f");
+    pxRect(ox+4*s,oy+5*s,2*s,2*s,"#b6ffb6");
+  } else if(kind===2){ // ORANGE
+    pxRect(ox+6*s,oy+1*s,2*s,2*s,"#2f9a2f");
+    pxRect(ox+3*s,oy+3*s,8*s,9*s,"#ff9010"); pxRect(ox+2*s,oy+5*s,10*s,5*s,"#ff9010");
+    pxRect(ox+4*s,oy+5*s,2*s,2*s,"#ffd89a"); pxRect(ox+8*s,oy+8*s,2*s,2*s,"#d96b00");
+  } else { // GRAPE
+    pxRect(ox+6*s,oy+0*s,1*s,2*s,"#2f9a2f"); pxRect(ox+7*s,oy+1*s,3*s,1*s,"#3fbf3f");
+    const cells=[[4,2],[7,2],[2,5],[5,5],[8,5],[4,8],[7,8],[5,11]];
+    cells.forEach(([cx,cy],i)=>{ pxRect(ox+cx*s,oy+cy*s,3*s,3*s, i%2?"#8a3cf0":"#b060ff");
+      pxRect(ox+cx*s,oy+cy*s,1*s,1*s,"#e0c0ff"); });
+  }
+}
+function drawRock(x,y,shake){
+  const s=3, ox=x+3+(shake||0), oy=y+3;
+  pxRect(ox+3*s,oy+2*s,8*s,2*s,"#9aa2ae");
+  pxRect(ox+2*s,oy+4*s,10*s,6*s,"#8890a0");
+  pxRect(ox+3*s,oy+10*s,8*s,2*s,"#6c7482");
+  pxRect(ox+3*s,oy+3*s,3*s,2*s,"#d6dce6");
+  pxRect(ox+7*s,oy+6*s,2*s,2*s,"#5b626e");
+  pxRect(ox+4*s,oy+8*s,2*s,1*s,"#5b626e");
+  ctx.strokeStyle="#41474f"; ctx.lineWidth=2; ctx.strokeRect(x+3,y+3,TS-6,TS-6);
+}
+function drawCheese(x,y,t){
+  const s=3, bob=Math.sin(t/12)*2|0, ox=x+3, oy=y+4+bob;
+  pxRect(ox+1*s,oy+4*s,12*s,7*s,"#ffd21e");
+  pxRect(ox+1*s,oy+3*s,12*s,1*s,"#ffe97a");
+  pxRect(ox+2*s,oy+2*s,10*s,1*s,"#ffc400");
+  pxRect(ox+1*s,oy+11*s,12*s,1*s,"#c98d00");
+  pxRect(ox+3*s,oy+6*s,2*s,2*s,"#c98d00");
+  pxRect(ox+7*s,oy+5*s,2*s,2*s,"#c98d00");
+  pxRect(ox+9*s,oy+8*s,2*s,2*s,"#c98d00");
+  pxRect(ox+5*s,oy+9*s,1*s,1*s,"#c98d00");
+  if(Math.floor(t/8)%2===0){ pxRect(x+1,y+1,3,3,"#ffffff"); pxRect(x+TS-4,y+TS-6,3,3,"#ffffff"); }
+}
+function drawBall(x,y,t,locked){
+  const r=Math.floor(t/5)%2;
+  ctx.fillStyle = locked? "rgba(255,120,220,0.30)" : "rgba(120,220,255,0.28)";
+  ctx.fillRect(x-15,y-15,30,30);
+  pxRect(x-9,y-9,18,18,"#ffffff");
+  pxRect(x-12,y-6,24,12,"#ffffff");
+  pxRect(x-6,y-12,12,24,"#ffffff");
+  pxRect(x-9+(r?3:-3),y-9,6,6, locked?"#ff3fa4":"#39f0ff");
+  pxRect(x+3,y+3,6,6, locked?"#39f0ff":"#ff3fa4");
+  pxRect(x-3,y-3,6,6,"#ffe14d");
+}
+
+/* ============================================================
+   MAP GENERATION — randomized but deliberately composed
+   ============================================================ */
+function rint(a,b){ return a + Math.floor(Math.random()*(b-a+1)); }
+function choice(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+function inMap(x,y){ return x>=0 && y>=0 && x<COLS && y<ROWS; }
+function setTile(x,y,v){ if(inMap(x,y)) map[y][x]=v; }
+function getTile(x,y){ return inMap(x,y)?map[y][x]:T_ROCK; }
+
+function carveRect(x,y,w,h){
+  for(let j=y;j<y+h;j++) for(let i=x;i<x+w;i++) if(inMap(i,j)) map[j][i]=T_OPEN;
+}
+function carveH(y,x1,x2){ const a=Math.min(x1,x2),b=Math.max(x1,x2); for(let x=a;x<=b;x++) setTile(x,y,T_OPEN); }
+function carveV(x,y1,y2){ const a=Math.min(y1,y2),b=Math.max(y1,y2); for(let y=a;y<=b;y++) setTile(x,y,T_OPEN); }
+
+/* ============================================================
+   LAYOUT ARCHETYPES
+   Each function carves a completely different pre-dug tunnel
+   network and returns the "trunkY" main corridor row. Every new
+   game picks a different one, and each is randomised internally,
+   so no two runs start on the same map.
+   ============================================================ */
+let lastLayout = -1, layoutName = "";
+const LAYOUT_NAMES = ["CROSSROADS","LADDER","SPIRAL","TWIN PITS","RIVER","CATHEDRAL","HONEYCOMB","CANYON"];
+
+const LAYOUTS = [
+  /* 0. CROSSROADS - central trunk with a long corridor and side loops */
+  function(nx,ny){
+    const trunkY = rint(4,6);
+    carveV(nx, ny, trunkY);
+    const L = rint(1,3), R = rint(COLS-4, COLS-2);
+    carveH(trunkY, L, R);
+    const loopY = Math.min(ROWS-2, trunkY+rint(2,3));
+    carveV(L, trunkY, loopY); carveV(R, trunkY, loopY);
+    carveH(loopY, L, L+rint(1,3));
+    carveH(loopY, R-rint(1,3), R);
+    return trunkY;
+  },
+  /* 1. LADDER - two long horizontal galleries joined by rungs */
+  function(nx,ny){
+    const topRow = rint(3,4), botRow = rint(ROWS-4, ROWS-3);
+    carveV(nx, ny, topRow);
+    carveH(topRow, 0, COLS-1);
+    carveH(botRow, 1, COLS-2);
+    const rungs = rint(3,4);
+    for(let i=0;i<rungs;i++){
+      const x = Math.round(1 + i*(COLS-3)/(rungs-1)) + rint(-1,1);
+      carveV(Math.max(0,Math.min(COLS-1,x)), topRow, botRow);
+    }
+    return topRow;
+  },
+  /* 2. SPIRAL - a coiled tunnel winding inward */
+  function(nx,ny){
+    let x1=1, y1=rint(2,3), x2=COLS-2, y2=ROWS-2;
+    carveV(nx, ny, y1);
+    let guard=0;
+    while(x1<x2-1 && y1<y2-1 && guard++<6){
+      carveH(y1, x1, x2);
+      carveV(x2, y1, y2);
+      carveH(y2, x1+1, x2);
+      carveV(x1+1, y1+2, y2);
+      x1+=2; x2-=2; y1+=2; y2-=2;
+    }
+    return rint(3,4);
+  },
+  /* 3. TWIN PITS - two big open chambers linked by a thin neck */
+  function(nx,ny){
+    const cy = rint(3,5);
+    carveRect(1, cy, 4, 3);
+    carveRect(COLS-5, cy, 4, 3);
+    carveH(cy+1, 1, COLS-2);              // connecting neck
+    carveV(nx, ny, cy+1);
+    carveV(2, cy+2, ROWS-2);
+    carveV(COLS-3, cy+2, ROWS-2);
+    carveH(ROWS-2, 2, COLS-3);
+    return cy+1;
+  },
+  /* 4. RIVER - a meandering diagonal channel across the cavern */
+  function(nx,ny){
+    let x = rint(1,3), y = rint(3,4);
+    carveV(nx, ny, y);
+    const startY=y;
+    while(x < COLS-1){
+      const run = rint(2,3);
+      carveH(y, x, Math.min(COLS-1, x+run));
+      x += run;
+      const drop = rint(1,2) * (y < ROWS-4 ? 1 : -1);
+      const ny2 = Math.max(1, Math.min(ROWS-2, y+drop));
+      carveV(Math.min(COLS-1,x), y, ny2);
+      y = ny2;
+    }
+    carveH(ROWS-2, rint(1,3), rint(COLS-4,COLS-2));
+    return startY;
+  },
+  /* 5. CATHEDRAL - a tall central hall with symmetric side aisles */
+  function(nx,ny){
+    const cx = Math.floor(COLS/2);
+    carveV(cx, 0, ROWS-2);
+    carveV(nx, ny, rint(3,4));
+    const arches = rint(2,3);
+    for(let i=0;i<arches;i++){
+      const y = 3 + i*Math.floor((ROWS-5)/arches);
+      carveH(y, 1, COLS-2);
+    }
+    carveV(1, 3, ROWS-3);
+    carveV(COLS-2, 3, ROWS-3);
+    return 3;
+  },
+  /* 6. HONEYCOMB - scattered small chambers joined by short links */
+  function(nx,ny){
+    const trunkY = rint(3,4);
+    carveV(nx, ny, trunkY);
+    carveH(trunkY, 1, COLS-2);
+    const cells = rint(4,6);
+    const spots=[];
+    for(let i=0;i<cells;i++){
+      const x=rint(1,COLS-3), y=rint(trunkY+1, ROWS-3);
+      carveRect(x, y, 2, 2);
+      spots.push({x,y});
+    }
+    // link each chamber back toward the trunk
+    for(const s of spots){
+      if(Math.random()<0.5){ carveV(s.x, trunkY, s.y); }
+      else { carveH(s.y, s.x, Math.max(1,Math.min(COLS-2, s.x+rint(-3,3)))); carveV(s.x, trunkY, s.y); }
+    }
+    return trunkY;
+  },
+  /* 7. CANYON - deep vertical shafts joined only at top and bottom */
+  function(nx,ny){
+    const top = rint(2,3), bot = ROWS-2;
+    carveV(nx, ny, top);
+    carveH(top, 0, COLS-1);
+    carveH(bot, 0, COLS-1);
+    const shafts = rint(3,5);
+    for(let i=0;i<shafts;i++){
+      const x = Math.round(1 + i*(COLS-3)/Math.max(1,shafts-1)) + rint(-1,1);
+      const depth = rint(ROWS-4, bot);
+      carveV(Math.max(0,Math.min(COLS-1,x)), top, depth);
+    }
+    return top;
+  }
+];
+
+function generateStage(stg){
+  map=[]; fruitKind=[];
+  for(let y=0;y<ROWS;y++){ map.push(new Array(COLS).fill(T_SOIL)); fruitKind.push(new Array(COLS).fill(-1)); }
+
+  /* --- 1. Pick a LAYOUT ARCHETYPE so every game looks different --- */
+  const nestX = rint(2, COLS-3);
+  const nestY = rint(1, 2);
+  nest = {x:nestX, y:nestY, monsterLeft:false, cheese:false};
+  carveRect(nestX-1, nestY-1, 3, 3);                 // nest chamber
+
+  // avoid repeating the previous layout back to back
+  let layout = rint(0, LAYOUTS.length-1);
+  if(LAYOUTS.length>1 && layout===lastLayout) layout=(layout+1+rint(0,LAYOUTS.length-2))%LAYOUTS.length;
+  lastLayout = layout;
+  layoutName = LAYOUT_NAMES[layout];
+
+  const trunkY = LAYOUTS[layout](nestX, nestY);      // carve the tunnel network
+
+  // a top entrance route used by the ALERT monsters (always present)
+  const topX = rint(1, COLS-2);
+  carveV(topX, 0, rint(1,3));
+  carveH(rint(0,2), Math.min(topX,nestX), Math.max(topX,nestX));
+
+  /* --- 2. Player starting pocket (position varies by layout) --- */
+  let psx, psy;
+  if(layout===3){ psx = rint(1,2)===1 ? 1 : COLS-2; psy = rint(ROWS-4, ROWS-2); }
+  else if(layout===5){ psx = Math.floor(COLS/2); psy = ROWS-2; }
+  else { psx = rint(2, COLS-3); psy = rint(ROWS-3, ROWS-2); }
+  psx=Math.max(1,Math.min(COLS-2,psx)); psy=Math.max(1,Math.min(ROWS-2,psy));
+  carveRect(psx-1, psy-1, 3, 3);
+
+  /* --- 3. Fruit clusters: designed block patterns, randomly placed --- */
+  const patterns = [
+    ["XXX","XXX"],          // 3x2 block
+    ["XXX"],                // row of 3
+    ["XX","XX","XX"],       // 2x3 column
+    ["XX","XX"],            // 2x2 square
+    ["XXX",".X."],          // T shape
+    [".X.","XXX",".X."]     // plus / diamond
+  ];
+  const clusters = 5 + Math.min(4, stg);            // more fruit each stage
+  let placed=0, tries=0;
+  const anchors=[];
+  while(placed<clusters && tries<400){
+    tries++;
+    const pat = choice(patterns);
+    const w = pat[0].length, h = pat.length;
+    // alternate left / right halves so both sides get dense areas
+    const leftSide = placed%2===0;
+    const lmax = Math.max(0, Math.floor(COLS/2)-w-1);
+    const rmin = Math.min(COLS-w-1, Math.floor(COLS/2)+1);
+    const x = leftSide ? rint(0, lmax) : rint(rmin, Math.max(rmin, COLS-w-1));
+    const ymin = 0;
+    const y = rint(ymin, Math.max(ymin, ROWS-h));
+    // must be fully on soil and keep 1-tile spacing from other clusters
+    let ok=true;
+    for(let j=-1;j<=h;j++) for(let i=-1;i<=w;i++){
+      const tx=x+i, ty=y+j;
+      if(!inMap(tx,ty)){ continue; }
+      if(j>=0&&j<h&&i>=0&&i<w){ if(map[ty][tx]!==T_SOIL) ok=false; }
+    }
+    for(const a of anchors){ if(Math.abs(a.x-x)<w+1 && Math.abs(a.y-y)<h+1) ok=false; }
+    if(!ok) continue;
+    const kindBase = rint(0,3);
+    for(let j=0;j<h;j++) for(let i=0;i<w;i++){
+      if(pat[j][i]!=="X") continue;
+      const tx=x+i, ty=y+j;
+      map[ty][tx]=T_FRUIT;
+      // cluster mostly one fruit type, with a sprinkle of a rarer one
+      fruitKind[ty][tx] = (Math.random()<0.75) ? kindBase : rint(0,3);
+    }
+    anchors.push({x,y}); placed++;
+  }
+
+  /* --- 3b. Guarantee a decent fruit count on every layout --- */
+  const MIN_FRUIT = 14 + stg*2;
+  let fcount=0;
+  for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++) if(map[y][x]===T_FRUIT) fcount++;
+  let fill=0;
+  while(fcount<MIN_FRUIT && fill++<600){
+    const x=rint(0,COLS-1), y=rint(0,ROWS-1);
+    if(map[y][x]!==T_SOIL) continue;
+    // prefer soil that touches an existing fruit so it still forms clusters
+    let near=false;
+    for(const d in DIRS){ const [dx,dy]=DIRS[d];
+      if(inMap(x+dx,y+dy) && map[y+dy][x+dx]===T_FRUIT) near=true; }
+    if(!near && fill<300) continue;
+    map[y][x]=T_FRUIT;
+    fruitKind[y][x]=rint(0,3);
+    fcount++;
+  }
+
+  /* --- 4. Rocks --- */
+  const rockCount = 3 + stg;
+  let rp=0, rt=0;
+  while(rp<rockCount && rt<500){
+    rt++;
+    const x=rint(0,COLS-1), y=rint(1,ROWS-3);
+    if(map[y][x]!==T_SOIL) continue;
+    if(Math.abs(x-psx)<2 && Math.abs(y-psy)<2) continue;
+    // don't wall off the nest trunk
+    if(x===nestX && y<=trunkY) continue;
+    map[y][x]=T_ROCK; rp++;
+  }
+
+  /* --- 5. Counts / entities --- */
+  fruitTotal=0;
+  for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++) if(map[y][x]===T_FRUIT) fruitTotal++;
+  fruitGot=0; enemyKills=0;
+  killGoal = stg>=2 ? Math.min(2+stg, 6) : 0;
+
+  player = mkEntity(psx, psy, 2.2);
+  player.dir="up"; player.alive=true;
+
+  enemies=[]; ball=null; fallingRocks=[]; popups=[]; particles=[];
+  cheeseEaten=false; alertPhase=false; alertTimer=0; freezeTimer=0; paletteMode=0;
+
+  /* --- 6. THE MONSTER-MAKING MACHINE --------------------------
+     The nest is not cheese yet. It is a machine that manufactures
+     FIVE monsters one at a time. Only after the fifth one has
+     crawled out of the machine does the machine break down and
+     morph (flash + zoom-in) into the cheese bonus.            */
+  machine = {
+    x: nest.x, y: nest.y,
+    total: 5, made: 0,
+    timer: 150,          // frames until the next monster pops out
+    interval: 170,
+    charge: 0,           // build-up animation before each birth
+    flash: 0,
+    active: true,
+    broken: false,       // all five produced -> waiting for the last to leave
+    anim: 0
+  };
+  cheeseBirth = 0;       // zoom-in animation progress (0..1 driven by timer)
+  cheeseBirthT = 0;
+
+  readyTimer = 90;
+  stageMsgTimer = 120;
+}
+
+/* ============================================================
+   ENTITIES
+   ============================================================ */
+function mkEntity(gx,gy,speed){
+  return { gx, gy, px:gx*TS+TS/2, py:gy*TS+TS/2, tx:gx, ty:gy,
+           moving:false, dir:"down", speed:speed, anim:0 };
+}
+function mkEnemy(gx,gy,type){
+  const e = mkEntity(gx,gy,ENEMY_TYPES[type].speed);
+  e.type=type; e.alive=true; e.releaseDelay=0; e.frozen=0;
+  e.lastDir=null; e.isAlert=(type[0]==="X");
+  return e;
+}
+
+/* ---- TERRAIN RULES --------------------------------------
+   canPlayerEnter : everything except ROCK / out of bounds
+   canMonsterEnter: only OPEN-like tiles (monsters NEVER dig)
+-----------------------------------------------------------*/
+function canPlayerEnter(x,y){
+  if(!inMap(x,y)) return false;
+  return map[y][x] !== T_ROCK;
+}
+function canMonsterEnter(x,y){
+  if(!inMap(x,y)) return false;
+  const t=map[y][x];
+  return t===T_OPEN || t===T_CHEESE;   // NOT soil, NOT fruit(soil), NOT rock
+}
+
+const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
+
+/* ---- PLAYER MOVE + DIG ---- */
+function tryStartPlayerMove(dir){
+  if(player.moving) return;
+  const [dx,dy]=DIRS[dir];
+  const nx=player.gx+dx, ny=player.gy+dy;
+  player.dir=dir;
+  if(!canPlayerEnter(nx,ny)) return;      // ONLY rock / edge blocks
+  const t=map[ny][nx];
+  if(t===T_SOIL){                          // DIG
+    map[ny][nx]=T_OPEN;
+    Audio8.sfx.dig();
+    spawnDirt(nx,ny);
+  } else if(t===T_FRUIT){                  // DIG + COLLECT
+    collectFruit(nx,ny);
+  } else if(t===T_CHEESE){
+    eatCheese(nx,ny);
+  }
+  player.tx=nx; player.ty=ny; player.moving=true;
+}
+
+function collectFruit(x,y){
+  const k = fruitKind[y][x]>=0 ? fruitKind[y][x] : 0;
+  map[y][x]=T_OPEN; fruitKind[y][x]=-1;
+  const pts=FRUIT_KINDS[k].pts;
+  addScore(pts); fruitGot++; matchFruit++;
+  popups.push({x:x*TS+TS/2,y:y*TS+TS/2,txt:"+"+pts,life:45,col:"#ffe14d"});
+  Audio8.sfx.fruit();
+  spawnDirt(x,y);
+}
+
+/* ---- CHEESE EVENT ---- */
+function eatCheese(x,y){
+  map[y][x]=T_OPEN; nest.cheese=false; cheeseEaten=true; cheeseBirth=0;
+  screenFlash=20; shake=12;                       // snatch flash
+  for(let p=0;p<36;p++){
+    const a=Math.random()*Math.PI*2, s=1+Math.random()*5;
+    particles.push({x:x*TS+HALF,y:y*TS+HALF,vx:Math.cos(a)*s,vy:Math.sin(a)*s,
+      life:24+Math.random()*18, col:(p%2)?"#ffd21e":"#ffffff"});
+  }
+  addScore(CHEESE_POINTS);
+  popups.push({x:x*TS+HALF,y:y*TS-6,txt:"+"+CHEESE_POINTS,life:110,col:"#ffd21e",big:true});
+  Audio8.sfx.cheese(); setTimeout(()=>Audio8.sfx.bonus1500(),260);
+  paletteMode=1;                                   // 3. map colour change
+  // 2. freeze existing monsters 5 seconds
+  freezeTimer = 300;
+  enemies.forEach(e=>{ if(e.alive) e.frozen=300; });
+  // spawn three DIFFERENT, faster monsters from the TOP route
+  const tops=[];
+  for(let cx=0;cx<COLS;cx++) if(map[0][cx]===T_OPEN) tops.push(cx);
+  const entry = tops.length? choice(tops) : nest.x;
+  ["X1","X2","X3"].forEach((t,i)=>{
+    const e=mkEnemy(entry, 0, t);
+    e.speed = ENEMY_TYPES[t].speed + (stage-1)*0.1;
+    e.releaseDelay = i*22;
+    enemies.push(e);
+  });
+  Audio8.sfx.enemyAppear(); Audio8.sfx.alert();
+  alertPhase=true; alertTimer=CHEESE_TIME;         // 8 second finale
+  for(let i=0;i<40;i++) particles.push({x:entry*TS+HALF,y:8,vx:(Math.random()-0.5)*6,vy:Math.random()*4,life:40,col:"#ff5ce0"});
+}
+
+/* ---- SCORE ---- */
+function addScore(n){
+  score+=n;
+  if(score>highScore){ highScore=score; localStorage.setItem("ua_high",String(highScore)); }
+}
+
+/* ---- effects ---- */
+function spawnDirt(gx,gy){
+  for(let i=0;i<6;i++) particles.push({
+    x:gx*TS+TS/2, y:gy*TS+TS/2, vx:(Math.random()-0.5)*3, vy:(Math.random()-0.5)*3,
+    life:18+Math.random()*10, col: paletteMode? "#8b5cc0":"#a75c26" });
+}
+function boom(x,y,col){
+  for(let i=0;i<24;i++){
+    const a=Math.random()*Math.PI*2, s=1+Math.random()*4;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:26+Math.random()*16,col:col||"#ffea00"});
+  }
+}
+
+/* ============================================================
+   INPUT
+   ============================================================ */
+const keys={};
+window.addEventListener("keydown", (e)=>{
+  const k=e.key;
+  if(["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," ","Spacebar","Backspace"].includes(k)) e.preventDefault();
+  Audio8.ensure(); Audio8.resume();
+  keys[k]=true; keys[k.toLowerCase&&k.length===1?k.toLowerCase():k]=true;
+  handleKeyPress(e);
+},{passive:false});
+window.addEventListener("keyup",(e)=>{
+  keys[e.key]=false;
+  if(e.key.length===1) keys[e.key.toLowerCase()]=false;
+});
+
+function dirFromKeys(){
+  if(keys["ArrowUp"]||keys["w"]||keys["W"]) return "up";
+  if(keys["ArrowDown"]||keys["s"]||keys["S"]) return "down";
+  if(keys["ArrowLeft"]||keys["a"]||keys["A"]) return "left";
+  if(keys["ArrowRight"]||keys["d"]||keys["D"]) return "right";
+  return null;
+}
+
+function handleKeyPress(e){
+  const k=e.key;
+  if(state===S_START){
+    if(k==="Enter"){
+      Audio8.sfx.menu();
+      if(playerName){                       // name already known -> straight into the game
+        startNewGame(); Audio8.start();
+      } else {                              // first time only
+        state=S_NAME; nameBuffer="";
+      }
+    }
+    else if(k==="n"||k==="N"){ state=S_NAME; nameBuffer=""; Audio8.sfx.menu(); }  // change name
+    else if(k==="h"||k==="H"){ openRanking(); }
+    return;
+  }
+  if(state===S_NAME){
+    if(k==="Enter"){
+      rememberName(nameBuffer.trim()===""? "PLAYER" : nameBuffer.trim());
+      startNewGame(); Audio8.sfx.menu(); Audio8.start();
+    } else if(k==="Escape"){ state=S_START; Audio8.sfx.menu(); }
+    else if(k==="Backspace"){ nameBuffer=nameBuffer.slice(0,-1); }
+    else if(/^[a-zA-Z0-9 ]$/.test(k) && nameBuffer.length<8){ nameBuffer+=k.toUpperCase(); Audio8.sfx.tick(); }
+    return;
+  }
+  if(state===S_PLAY){
+    if(k===" "||k==="Spacebar"){ throwBall(); }
+    else if(k==="p"||k==="P"){ state=S_PAUSE; Audio8.sfx.menu(); }
+    else if(k==="m"||k==="M"){ Audio8.toggle(); }
+    else if(k==="h"||k==="H"){ openRanking(); }
+    return;
+  }
+  if(state===S_PAUSE){
+    if(k==="p"||k==="P"||k==="Enter"){ state=S_PLAY; Audio8.sfx.menu(); }
+    else if(k==="m"||k==="M"){ Audio8.toggle(); }
+    return;
+  }
+  if(state===S_CLEAR){
+    if(k==="Enter"){ stage++; generateStage(stage); state=S_PLAY; Audio8.sfx.menu(); }
+    return;
+  }
+  if(state===S_OVER){
+    // ENTER goes straight into a new run (short delay so the result is seen)
+    if(k==="Enter"){ if(overTimer>40){ startNewGame(); Audio8.sfx.menu(); Audio8.start(); } }
+    else if(k==="h"||k==="H"){ openRanking(); }      // ranking only on request
+    else if(k==="n"||k==="N"){ state=S_NAME; nameBuffer=""; Audio8.sfx.menu(); }
+    else if(k==="Escape"){ state=S_START; }
+    return;
+  }
+  if(state===S_HIGH){
+    // ENTER = play again right away, ESC = back to the title
+    if(k==="Enter"){ startNewGame(); Audio8.sfx.menu(); Audio8.start(); }
+    else if(k==="h"||k==="H"||k==="Escape"){ state=(prevStateForHigh===S_PLAY)?S_PLAY:S_START; Audio8.sfx.menu(); }
+    return;
+  }
+}
+
+function openRanking(){
+  prevStateForHigh=state; state=S_HIGH; rankLoading=true; rankList=[];
+  loadScores().then(r=>{ rankList=r; rankStats=buildRankStats(); rankLoading=false; });
+}
+
+function startNewGame(){
+  score=0; lives=3; stage=1;
+  matchKills=0; matchFruit=0; matchStart=Date.now();
+  generateStage(stage);
+  state=S_PLAY;
+}
+
+/* ============================================================
+   AIMING + BALL
+   The ball is no longer locked to 4 directions. The player gets
+   a real aim: a free 360 degree aim vector (8-way with the keys)
+   AND an auto lock-on to the monster the aim is pointing at.
+   Once fired the ball homes gently onto the locked monster while
+   it has a clear tunnel line to it.
+   ============================================================ */
+let aimTarget=null, aimAngle=-Math.PI/2, aimLocked=false;
+
+/* is this pixel position inside a tile the ball can fly through? */
+function ballOpenAt(x,y){
+  const gx=Math.floor(x/TS), gy=Math.floor(y/TS);
+  if(!inMap(gx,gy)) return false;
+  const t=map[gy][gx];
+  return t===T_OPEN || t===T_CHEESE;
+}
+/* clear tunnel line of sight between two pixel points */
+function lineOfSight(x1,y1,x2,y2){
+  const d=Math.hypot(x2-x1,y2-y1);
+  const steps=Math.ceil(d/6);
+  for(let i=1;i<steps;i++){
+    const t=i/steps;
+    if(!ballOpenAt(x1+(x2-x1)*t, y1+(y2-y1)*t)) return false;
+  }
+  return true;
+}
+
+/* choose the monster the player is aiming at */
+function updateAim(){
+  if(!player || !player.alive){ aimTarget=null; aimLocked=false; return; }
+  // 1. base aim direction from the held keys (supports 8-way diagonals)
+  let ax=0, ay=0;
+  if(keys["ArrowUp"]||keys["w"]||keys["W"]) ay-=1;
+  if(keys["ArrowDown"]||keys["s"]||keys["S"]) ay+=1;
+  if(keys["ArrowLeft"]||keys["a"]||keys["A"]) ax-=1;
+  if(keys["ArrowRight"]||keys["d"]||keys["D"]) ax+=1;
+  if(ax===0 && ay===0){ const d=DIRS[player.dir]; ax=d[0]; ay=d[1]; }
+  const baseAngle=Math.atan2(ay,ax);
+
+  // 2. find the best visible monster near that aim direction
+  let best=null, bestScore=1e9;
+  for(const e of enemies){
+    if(!e.alive || e.releaseDelay>0) continue;
+    const dx=e.px-player.px, dy=e.py-player.py;
+    const dist=Math.hypot(dx,dy);
+    if(dist>TS*7) continue;
+    if(!lineOfSight(player.px,player.py,e.px,e.py)) continue;
+    let diff=Math.abs(Math.atan2(dy,dx)-baseAngle);
+    while(diff>Math.PI) diff=Math.abs(diff-Math.PI*2);
+    if(diff>Math.PI*0.62) continue;                 // outside the aim cone
+    const sc = dist + diff*160;                     // prefer close + well aimed
+    if(sc<bestScore){ bestScore=sc; best=e; }
+  }
+  aimTarget = best;
+  aimLocked = !!best;
+  aimAngle = best ? Math.atan2(best.py-player.py, best.px-player.px) : baseAngle;
+}
+
+function throwBall(){
+  if(ball) return;
+  updateAim();
+  ball = { x:player.px, y:player.py,
+           dx:Math.cos(aimAngle), dy:Math.sin(aimAngle),
+           speed:7.0, bounces:0, life:280, anim:0,
+           target: aimTarget, homing: aimLocked ? 0.16 : 0.0, trail:[] };
+  Audio8.sfx.throwBall();
+}
+
+function updateBall(){
+  if(!ball) return;
+  ball.anim++; ball.life--;
+  if(ball.life<=0){ ball=null; return; }
+
+  // --- homing: steer toward the locked monster while it is visible ---
+  const tg = ball.target;
+  if(tg && tg.alive && ball.homing>0 && lineOfSight(ball.x,ball.y,tg.px,tg.py)){
+    const want=Math.atan2(tg.py-ball.y, tg.px-ball.x);
+    let cur=Math.atan2(ball.dy, ball.dx);
+    let diff=want-cur;
+    while(diff> Math.PI) diff-=Math.PI*2;
+    while(diff<-Math.PI) diff+=Math.PI*2;
+    cur += Math.max(-ball.homing, Math.min(ball.homing, diff));
+    ball.dx=Math.cos(cur); ball.dy=Math.sin(cur);
+  }
+
+  // --- move in sub-steps, reflecting off solid terrain axis by axis ---
+  const steps=3, sp=ball.speed/steps;
+  for(let i=0;i<steps;i++){
+    const nx=ball.x+ball.dx*sp, ny=ball.y+ball.dy*sp;
+    let hit=false;
+    if(!ballOpenAt(nx, ball.y)){ ball.dx*=-1; hit=true; }
+    if(!ballOpenAt(ball.x, ny)){ ball.dy*=-1; hit=true; }
+    if(hit){
+      ball.bounces++; ball.homing*=0.6;
+      Audio8.sfx.bounce();
+      if(ball.bounces>4){ ball=null; return; }
+      continue;
+    }
+    ball.x=nx; ball.y=ny;
+
+    // --- monster hit ---
+    for(const e of enemies){
+      if(!e.alive || e.releaseDelay>0) continue;
+      if(Math.hypot(e.px-ball.x, e.py-ball.y) < TS*0.58){
+        killEnemy(e,false); ball=null; return;
+      }
+    }
+  }
+
+  // trail sparkle
+  ball.trail.push({x:ball.x,y:ball.y,life:10});
+  if(ball.trail.length>8) ball.trail.shift();
+  ball.trail.forEach(p=>p.life--);
+
+  // caught again by the player
+  if(ball.bounces>0 && Math.hypot(ball.x-player.px, ball.y-player.py) < TS*0.45) ball=null;
+}
+
+/* aim reticle + guide line */
+function drawAim(){
+  if(!player || !player.alive || ball) return;
+  const len = aimLocked ? Math.hypot(aimTarget.px-player.px, aimTarget.py-player.py) : TS*2.4;
+  const ex=player.px+Math.cos(aimAngle)*len, ey=player.py+Math.sin(aimAngle)*len;
+  // dotted guide
+  const dots=Math.max(2,Math.floor(len/10));
+  for(let i=1;i<dots;i++){
+    const t=i/dots;
+    const x=player.px+(ex-player.px)*t, y=player.py+(ey-player.py)*t;
+    if(!ballOpenAt(x,y)) break;
+    ctx.fillStyle = aimLocked ? ((frame+i*2)%10<5 ? "#ff3fa4":"#ffd21e") : "rgba(120,220,255,0.5)";
+    ctx.fillRect((x|0)-1,(y|0)-1,3,3);
+  }
+  if(aimLocked && aimTarget){
+    const t=aimTarget, s=TS*0.62, b=(frame%16<8)?"#ff3fa4":"#ffe14d";
+    ctx.fillStyle=b;
+    // pixel corner brackets around the locked monster
+    const L=8, w=3;
+    ctx.fillRect(t.px-s, t.py-s, L, w); ctx.fillRect(t.px-s, t.py-s, w, L);
+    ctx.fillRect(t.px+s-L, t.py-s, L, w); ctx.fillRect(t.px+s-w, t.py-s, w, L);
+    ctx.fillRect(t.px-s, t.py+s-w, L, w); ctx.fillRect(t.px-s, t.py+s-L, w, L);
+    ctx.fillRect(t.px+s-L, t.py+s-w, L, w); ctx.fillRect(t.px+s-w, t.py+s-L, w, L);
+    text("LOCK", t.px, t.py-s-6, 11, b, "center");
+  }
+}
+function killEnemy(e, byRock){
+  e.alive=false; enemyKills++;
+  /* --- unified scoring: EVERY monster kill is worth 500 points --- */
+  const pts = KILL_POINTS + (byRock ? ROCK_BONUS : 0);
+  addScore(pts);
+  matchKills++;
+  popups.push({x:e.px,y:e.py,txt:"+"+pts,life:45,col: byRock? "#9af":"#8f8"});
+  boom(e.px,e.py, e.isAlert? "#ff5ce0":"#ffea00");
+  Audio8.sfx.kill();
+}
+
+/* ============================================================
+   ENEMY AI — monsters follow tunnels, they NEVER dig
+   ============================================================ */
+function updateEnemy(e){
+  if(!e.alive) return;
+  if(e.releaseDelay>0){ e.releaseDelay--; return; }
+  if(e.frozen>0){ e.frozen--; e.anim++; return; }
+  e.anim++;
+
+  if(!e.moving){
+    // if enemy is sitting on non-open tile (nest start), allow it to step to any open neighbour
+    const opts=[];
+    for(const d in DIRS){
+      const [dx,dy]=DIRS[d];
+      if(canMonsterEnter(e.gx+dx, e.gy+dy)) opts.push(d);
+    }
+    if(opts.length===0){ return; }     // fully walled by soil -> stop (no digging!)
+    const back = e.lastDir ? ({up:"down",down:"up",left:"right",right:"left"})[e.lastDir] : null;
+    let pool = opts.filter(d=>d!==back);
+    if(pool.length===0) pool=opts;     // dead end: allow turning around
+    // chase: pick direction minimising distance to player, with some randomness
+    let dir;
+    if(Math.random()<0.82){
+      let best=null,bd=1e9;
+      for(const d of pool){
+        const [dx,dy]=DIRS[d];
+        const nx=e.gx+dx, ny=e.gy+dy;
+        const dist=Math.abs(nx-player.gx)+Math.abs(ny-player.gy);
+        if(dist<bd){ bd=dist; best=d; }
+      }
+      dir=best;
+    } else dir=choice(pool);
+    const [dx,dy]=DIRS[dir];
+    e.dir=dir; e.lastDir=dir; e.tx=e.gx+dx; e.ty=e.gy+dy; e.moving=true;
+
+    // track that this monster has physically left the machine chamber
+    if(!e.leftNest){
+      const far = Math.abs(e.gx-machine.x)+Math.abs(e.gy-machine.y);
+      if(far>=2){ e.leftNest=true; nest.monsterLeft=true; }
+    }
+  }
+  stepEntity(e);
+}
+
+/* smooth grid movement */
+function stepEntity(ent){
+  if(!ent.moving) return;
+  const destX=ent.tx*TS+TS/2, destY=ent.ty*TS+TS/2;
+  const dx=destX-ent.px, dy=destY-ent.py;
+  const d=Math.hypot(dx,dy);
+  if(d<=ent.speed){ ent.px=destX; ent.py=destY; ent.gx=ent.tx; ent.gy=ent.ty; ent.moving=false; }
+  else { ent.px+=dx/d*ent.speed; ent.py+=dy/d*ent.speed; }
+}
+
+/* ============================================================
+   MONSTER-MAKING MACHINE
+   The machine manufactures 5 monsters, then breaks down and
+   transforms into the cheese (flash + zoom-in) once the last
+   monster has crawled away from it.
+   ============================================================ */
+function machineBornEnemy(){
+  const i = machine.made;
+  const t = (i%2===1 && stage>=2) ? "B" : "A";
+  const e = mkEnemy(machine.x, machine.y, t);
+  e.speed = ENEMY_TYPES[t].speed + (stage-1)*0.12;
+  e.releaseDelay = 18;                 // brief "climbing out" pause
+  e.leftNest = false;
+  e.bornFromMachine = true;
+  enemies.push(e);
+  machine.made++;
+  machine.flash = 16;
+  screenFlash = Math.max(screenFlash, 8);
+  Audio8.sfx.enemyAppear();
+  popups.push({x:machine.x*TS+HALF, y:machine.y*TS+2,
+               txt:"MONSTER "+machine.made+"/"+machine.total, life:50, col:"#ff7bd5"});
+  for(let p=0;p<18;p++){
+    const a=Math.random()*Math.PI*2;
+    particles.push({x:machine.x*TS+HALF,y:machine.y*TS+HALF,
+      vx:Math.cos(a)*(1+Math.random()*3), vy:Math.sin(a)*(1+Math.random()*3),
+      life:22+Math.random()*14, col: (p%2)?"#ff7bd5":"#9ff"});
+  }
+}
+
+function updateMachine(){
+  if(!machine.active) return;
+  machine.anim++;
+  if(machine.flash>0) machine.flash--;
+
+  if(!machine.broken){
+    machine.timer--;
+    machine.charge = machine.timer<45 ? (45-machine.timer)/45 : 0;
+    if(machine.timer===44) Audio8.sfx.tick();
+    if(machine.timer<=0){
+      machineBornEnemy();
+      if(machine.made>=machine.total){
+        machine.broken = true;         // all five produced
+        popups.push({x:machine.x*TS+HALF,y:machine.y*TS-8,txt:"MACHINE BROKEN!",life:80,col:"#f66"});
+      } else {
+        machine.timer = machine.interval;
+      }
+    }
+    return;
+  }
+
+  // broken: wait until every produced monster has walked away from it
+  machine.brokenWait = (machine.brokenWait||0)+1;
+  const stillInside = enemies.some(e=>e.alive && e.bornFromMachine && !e.leftNest);
+  if(stillInside && machine.brokenWait<600) return;   // failsafe so it can never stall
+
+  // ----- TRANSFORM: machine -> CHEESE (flash + zoom-in) -----
+  machine.active=false;
+  if(map[machine.y][machine.x]===T_OPEN && !cheeseEaten){
+    map[machine.y][machine.x]=T_CHEESE;
+    nest.cheese=true;
+    cheeseBirth=1; cheeseBirthT=0;
+    screenFlash=18; shake=10;
+    Audio8.sfx.cheese();
+    popups.push({x:machine.x*TS+HALF,y:machine.y*TS-6,txt:"CHEESE!",life:110,col:"#ffd21e",big:true});
+    for(let p=0;p<44;p++){
+      const a=Math.random()*Math.PI*2, s=1+Math.random()*5;
+      particles.push({x:machine.x*TS+HALF,y:machine.y*TS+HALF,vx:Math.cos(a)*s,vy:Math.sin(a)*s,
+        life:26+Math.random()*20, col:(p%3===0)?"#ffffff":((p%3===1)?"#ffd21e":"#ff9010")});
+    }
+  }
+}
+
+/* machine pixel art (drawn procedurally, original design) */
+function drawMachine(x,y,t,charge,flash){
+  const s=3, ox=x+3, oy=y+3;
+  const hot = flash>0 && Math.floor(flash/2)%2===0;
+  const body = hot ? "#ffffff" : "#5a6472";
+  const trim = hot ? "#ffe14d" : "#8b98ab";
+  pxRect(ox+0*s,oy+2*s,14*s,11*s,body);
+  pxRect(ox+0*s,oy+2*s,14*s,1*s,trim);
+  pxRect(ox+1*s,oy+0*s,3*s,2*s,"#3d4550");
+  pxRect(ox+10*s,oy+0*s,3*s,2*s,"#3d4550");
+  // glowing core, pulses stronger as a monster is being built
+  const glow = 0.35 + 0.65*Math.max(charge, Math.abs(Math.sin(t/14)));
+  const cr = Math.round(120+135*glow), cg=Math.round(20+60*glow), cb=Math.round(120+135*glow);
+  pxRect(ox+4*s,oy+5*s,6*s,5*s,"rgb("+cr+","+cg+","+cb+")");
+  pxRect(ox+5*s,oy+6*s,4*s,3*s, hot?"#fff":"#ff9af0");
+  // rivets and vents
+  pxRect(ox+1*s,oy+4*s,2*s,1*s,"#2b313a"); pxRect(ox+1*s,oy+7*s,2*s,1*s,"#2b313a");
+  pxRect(ox+11*s,oy+4*s,2*s,1*s,"#2b313a"); pxRect(ox+11*s,oy+7*s,2*s,1*s,"#2b313a");
+  // hatch at the bottom, opens while charging
+  const open = Math.round(charge*3);
+  pxRect(ox+3*s,oy+12*s,8*s,2*s,"#2b313a");
+  pxRect(ox+(4-open)*s,oy+13*s,(6+open*2)*s,1*s, hot?"#ffe14d":"#111");
+  ctx.strokeStyle = hot? "#fff" : "#39414c"; ctx.lineWidth=2;
+  ctx.strokeRect(x+3,y+3,TS-6,TS-6);
+}
+
+/* ============================================================
+   ROCKS
+   ============================================================ */
+function updateRocks(){
+  // start falls
+  for(let y=ROWS-2;y>=0;y--){
+    for(let x=0;x<COLS;x++){
+      if(map[y][x]!==T_ROCK) continue;
+      if(map[y+1][x]===T_OPEN || map[y+1][x]===T_CHEESE){
+        map[y][x]=T_OPEN;
+        fallingRocks.push({x, y, px:x*TS, py:y*TS, vy:0, wobble:16});
+        Audio8.sfx.rock();
+      }
+    }
+  }
+  for(let i=fallingRocks.length-1;i>=0;i--){
+    const r=fallingRocks[i];
+    if(r.wobble>0){ r.wobble--; continue; }
+    r.vy=Math.min(r.vy+0.55, 9);
+    r.py+=r.vy;
+    const gx=Math.floor((r.px+TS/2)/TS);
+    const belowY=Math.floor((r.py+TS)/TS);
+    // collisions with characters
+    for(const e of enemies){
+      if(e.alive && e.releaseDelay<=0 && Math.abs(e.px-(r.px+HALF))<TS*0.6 && Math.abs(e.py-(r.py+HALF))<TS*0.65){
+        killEnemy(e,true);
+      }
+    }
+    if(player.alive && Math.abs(player.px-(r.px+HALF))<TS*0.55 && Math.abs(player.py-(r.py+HALF))<TS*0.6){
+      playerHit();
+    }
+    const landTile = inMap(gx,belowY)? map[belowY][gx] : T_ROCK;
+    if(belowY>=ROWS || (landTile!==T_OPEN && landTile!==T_CHEESE)){
+      const restY=Math.max(0,Math.min(ROWS-1, Math.floor(r.py/TS)));
+      if(map[restY][gx]===T_OPEN) map[restY][gx]=T_ROCK;
+      else { // find nearest open above
+        let ry=restY; while(ry>0 && map[ry][gx]!==T_OPEN) ry--;
+        if(map[ry][gx]===T_OPEN) map[ry][gx]=T_ROCK;
+      }
+      boom(r.px+TS/2, r.py+TS/2, "#9aa2ae");
+      Audio8.sfx.rock();
+      fallingRocks.splice(i,1);
+    }
+  }
+}
+
+/* ============================================================
+   PLAYER DEATH / STAGE FLOW
+   ============================================================ */
+function playerHit(){
+  if(!player.alive || deathTimer>0) return;
+  player.alive=false; deathTimer=100;
+  Audio8.sfx.death();
+  boom(player.px,player.py,"#ff4444");
+  lives--;
+}
+function respawnOrEnd(){
+  if(lives>0){
+    // respawn in a safe open pocket at the bottom
+    let best=null, bd=-1;
+    for(let y=ROWS-1;y>=0;y--) for(let x=0;x<COLS;x++){
+      if(map[y][x]!==T_OPEN) continue;
+      let md=1e9;
+      for(const e of enemies) if(e.alive) md=Math.min(md, Math.abs(e.gx-x)+Math.abs(e.gy-y));
+      if(md===1e9) md=99;
+      if(md>bd){ bd=md; best={x,y}; }
+    }
+    if(!best){ best={x:Math.floor(COLS/2), y:ROWS-2}; map[best.y][best.x]=T_OPEN; }
+    player = mkEntity(best.x,best.y,2.2);
+    player.alive=true; player.dir="up";
+    ball=null; readyTimer=70;
+  } else {
+    endGame();
+  }
+}
+function endGame(){
+  state=S_OVER;
+  Audio8.stop();
+  overTimer=0; myRank=0; rankStats=null;
+  // EVERY playthrough is recorded, then ranked against all past matches.
+  rankLoading=true; rankList=[];
+  saveScore(playerName, score, stage).then(()=>loadScores()).then(list=>{
+    rankList=list||[];
+    rankStats=buildRankStats();
+    myRank=rankStats.rank;                 // rank among ALL recorded matches
+    rankLoading=false;
+    if(myRank>0 && myRank<=10) Audio8.sfx.clear();
+  });
+}
+let overTimer=0, myRank=0;
+function stageClear(bonusMsg){
+  state=S_CLEAR;
+  Audio8.sfx.clear();
+  stageMsgTimer=0;
+  clearBonusMsg = bonusMsg || "";
+}
+let clearBonusMsg="";
+
+function checkObjectives(){
+  if(alertPhase){
+    /* THE CHEESE FINALE
+       - lasts 8 seconds
+       - ends INSTANTLY the moment EVERY monster on the map is defeated
+       - each kill is still worth 500 points                       */
+    alertTimer--;
+    if(alertTimer%60===0 && alertTimer>0) Audio8.sfx.tick();
+    const anyAlive = enemies.some(e=>e.alive);
+    if(!anyAlive){
+      addScore(WIPEOUT_BONUS);
+      alertPhase=false;
+      stageClear("ALL MONSTERS WIPED OUT!  BONUS +"+WIPEOUT_BONUS);
+      return;
+    }
+    if(alertTimer<=0){
+      addScore(SURVIVE_BONUS);
+      alertPhase=false;
+      stageClear("YOU SURVIVED THE 8 SECOND ALERT!  BONUS +"+SURVIVE_BONUS);
+      return;
+    }
+    return; // during the finale the normal goals are paused
+  }
+  const fruitDone = fruitGot>=fruitTotal;
+  const killDone  = enemyKills>=killGoal;
+  if(fruitDone && killDone) stageClear("");
+}
+
+/* ============================================================
+   UPDATE
+   ============================================================ */
+function update(){
+  frame++;
+  if(state!==S_PLAY) return;
+
+  if(stageMsgTimer>0) stageMsgTimer--;
+  if(freezeTimer>0) freezeTimer--;
+
+  if(deathTimer>0){
+    deathTimer--;
+    particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.life--;});
+    particles=particles.filter(p=>p.life>0);
+    if(deathTimer===0) respawnOrEnd();
+    return;
+  }
+  if(readyTimer>0){ readyTimer--; }
+
+  // PLAYER
+  if(player.alive && readyTimer<=0){
+    if(!player.moving){
+      const d=dirFromKeys();
+      if(d) tryStartPlayerMove(d);
+    }
+    stepEntity(player);
+    player.anim++;
+    // pick up items on arrival too (safety)
+    const t=map[player.gy][player.gx];
+    if(t===T_FRUIT) collectFruit(player.gx,player.gy);
+    else if(t===T_CHEESE) eatCheese(player.gx,player.gy);
+  }
+
+  // ENEMIES
+  for(const e of enemies) updateEnemy(e);
+  enemies = enemies.filter(e=>e.alive);
+
+  // collisions with player
+  if(player.alive && readyTimer<=0){
+    for(const e of enemies){
+      if(!e.alive || e.releaseDelay>0) continue;
+      if(Math.abs(e.px-player.px)<TS*0.6 && Math.abs(e.py-player.py)<TS*0.6){ playerHit(); break; }
+    }
+  }
+
+  updateAim();
+  updateMachine();
+  if(cheeseBirth>0){ cheeseBirthT++; if(cheeseBirthT>34) cheeseBirth=0; }
+  if(screenFlash>0) screenFlash--;
+  if(shake>0) shake--;
+
+  updateBall();
+  updateRocks();
+
+  // popups / particles
+  popups.forEach(p=>{ p.y-=0.5; p.life--; });
+  popups=popups.filter(p=>p.life>0);
+  particles.forEach(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.12; p.life--; });
+  particles=particles.filter(p=>p.life>0);
+
+  checkObjectives();
+}
+
+/* ============================================================
+   DRAWING
+   ============================================================ */
+function text(str,x,y,size,col,align){
+  ctx.fillStyle=col||"#fff";
+  ctx.font="bold "+size+"px 'Courier New',monospace";
+  ctx.textAlign=align||"left"; ctx.textBaseline="alphabetic";
+  ctx.fillText(str,x,y);
+}
+function pad(n,l){ let s=String(n); while(s.length<l) s="0"+s; return s; }
+
+function drawHUD(){
+  const P=PAL();
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,cv.width,HUD_H);
+  ctx.fillStyle=P.border; ctx.fillRect(0,HUD_H-4,cv.width,4);
+  text("1ST",10,18,13,"#f44");
+  text("SCORE "+pad(score,6),10,38,16,"#fff");
+  text("HIGH",236,18,12,"#4cf");
+  text(pad(highScore,6),236,38,16,"#ff3");
+  text("STAGE "+stage,440,18,13,"#8f8");
+  text("LIVES",440,38,13,"#f8f");
+  for(let i=0;i<Math.max(0,lives);i++){
+    drawSprite(SPR_PLAYER,PAL_PLAYER, 508+i*20, 24, 1);
+  }
+  const fc = "FRUIT "+pad(fruitGot,2)+"/"+pad(fruitTotal,2);
+  text(fc,10,57,13,"#ffb");
+  text("KILLS "+pad(matchKills,2)+" x500",118,57,13,"#faa");
+  if(alertPhase){
+    const secs=Math.ceil(alertTimer/60);
+    const left=enemies.filter(e=>e.alive).length;
+    text("ALERT "+secs+"s  MONSTERS "+left,258,57,13, (frame%12<6)?"#ff3":"#f0f");
+    // 8 second timer bar
+    ctx.fillStyle="#400"; ctx.fillRect(258,60,340,5);
+    ctx.fillStyle=(frame%8<4)?"#ff3":"#f0f";
+    ctx.fillRect(258,60,340*(alertTimer/CHEESE_TIME),5);
+  } else if(nest.cheese){
+    text("GRAB THE CHEESE!  +"+CHEESE_POINTS,258,57,13,(frame%14<7)?"#ffd21e":"#fff");
+  } else if(machine.active){
+    text("MONSTER MACHINE "+machine.made+"/"+machine.total,258,57,13,
+         machine.broken? "#f66":"#ff7bd5");
+  }
+  text("M:MUSIC "+(Audio8.isOn()?"ON":"OFF"),318,18,11,"#666");
+  text("P:PAUSE  H:RANK",318,34,11,"#666");
+}
+
+function drawField(){
+  const P=PAL();
+  ctx.save();
+  const sx = shake>0 ? (Math.random()-0.5)*shake*0.6 : 0;
+  const sy = shake>0 ? (Math.random()-0.5)*shake*0.6 : 0;
+  ctx.translate(sx, FIELD_Y+sy);
+  ctx.fillStyle=P.tunnel; ctx.fillRect(0,0,FIELD_W,FIELD_H);
+
+  for(let y=0;y<ROWS;y++){
+    for(let x=0;x<COLS;x++){
+      const t=map[y][x], px=x*TS, py=y*TS;
+      if(t===T_SOIL || t===T_FRUIT){
+        ctx.fillStyle = ((x+y)%2===0)? P.soilA : P.soilB;
+        ctx.fillRect(px,py,TS,TS);
+        // pixel texture
+        ctx.fillStyle=P.soilDot;
+        const seed=(x*7+y*13);
+        for(let i=0;i<5;i++){
+          const sx=px+((seed*13+i*29)%28), sy=py+((seed*7+i*17)%28);
+          ctx.fillRect(sx,sy,3,3);
+        }
+        ctx.fillStyle="rgba(255,255,255,0.07)";
+        ctx.fillRect(px,py,TS,2);
+        ctx.fillStyle="rgba(0,0,0,0.22)";
+        ctx.fillRect(px,py+TS-2,TS,2);
+        if(t===T_FRUIT) drawFruit(fruitKind[y][x]<0?0:fruitKind[y][x], px, py);
+      } else if(t===T_ROCK){
+        drawRock(px,py,0);
+      } else if(t===T_CHEESE){
+        // zoom-in birth animation, then gentle idle sparkle
+        if(cheeseBirth>0){
+          const k = Math.min(1, cheeseBirthT/22);
+          const sc = k<1 ? (0.15 + 1.35*k - 0.5*k*k) : 1;   // overshoot then settle
+          ctx.save();
+          ctx.translate(px+TS/2, py+TS/2); ctx.scale(sc,sc); ctx.translate(-TS/2,-TS/2);
+          drawCheese(0,0,frame);
+          ctx.restore();
+          if(cheeseBirthT<14){
+            ctx.fillStyle="rgba(255,255,255,"+(0.75*(1-cheeseBirthT/14))+")";
+            ctx.fillRect(px-TS,py-TS,TS*3,TS*3);
+          }
+        } else {
+          drawCheese(px,py,frame);
+        }
+      } else {
+        // tunnel: faint grid so it reads as dug space
+        ctx.fillStyle=P.grid;
+        ctx.fillRect(px+1,py+1,TS-2,TS-2);
+        ctx.fillStyle=P.tunnel;
+        ctx.fillRect(px+3,py+3,TS-6,TS-6);
+      }
+    }
+  }
+  // the monster-making machine sits on the nest tile until it breaks
+  if(machine.active){
+    drawMachine(machine.x*TS, machine.y*TS, machine.anim, machine.charge, machine.flash);
+    // production counter above the machine
+    text(machine.made+"/"+machine.total, machine.x*TS+HALF, machine.y*TS-3, 12,
+         machine.broken? "#f66" : "#ff7bd5", "center");
+  }
+
+  // falling rocks
+  for(const r of fallingRocks){
+    const sh = r.wobble>0 ? ((r.wobble%4<2)?-2:2) : 0;
+    drawRock(r.px, r.py, sh);
+  }
+
+  // aim guide + ball
+  if(state===S_PLAY) drawAim();
+  if(ball){
+    for(const p of ball.trail){
+      ctx.fillStyle="rgba(255,255,255,"+Math.max(0,p.life/18)+")";
+      ctx.fillRect((p.x|0)-2,(p.y|0)-2,4,4);
+    }
+    drawBall(ball.x,ball.y,ball.anim, ball.homing>0);
+  }
+
+  // enemies
+  for(const e of enemies){
+    if(!e.alive || e.releaseDelay>0) continue;
+    const T=ENEMY_TYPES[e.type];
+    const bob = Math.floor(e.anim/8)%2;
+    let pal=T.pal;
+    if(e.frozen>0 && Math.floor(frame/6)%2===0){
+      pal={}; for(const k in T.pal) pal[k]="#7fd6ff";
+    }
+    drawSprite(T.spr, pal, e.px-HALF, e.py-HALF+bob, SPR);
+    if(e.frozen>0){ text("Z",e.px+14,e.py-20,14,"#9ff","center"); }
+  }
+
+  // player
+  if(player && player.alive){
+    if(readyTimer<=0 || Math.floor(frame/5)%2===0){
+      const bob=Math.floor(player.anim/7)%2;
+      const pal=(Math.floor(player.anim/10)%2)?PAL_PLAYER:PAL_PLAYER_ALT;
+      drawSprite(SPR_PLAYER, pal, player.px-HALF, player.py-HALF+bob, SPR);
+    }
+  }
+
+  // particles
+  for(const p of particles){ ctx.fillStyle=p.col; ctx.fillRect(p.x|0,p.y|0,3,3); }
+  // popups
+  for(const p of popups){
+    text(p.txt, p.x, p.y, p.big?18:13, p.col, "center");
+  }
+
+  // READY / stage banner
+  if(readyTimer>0 && state===S_PLAY){
+    text("READY!", FIELD_W/2, FIELD_H/2, 30, (frame%10<5)?"#ff3":"#fff","center");
+  }
+  if(stageMsgTimer>0 && state===S_PLAY){
+    text("STAGE "+stage+"   -   "+layoutName, FIELD_W/2, 40, 22,"#8ff","center");
+    text(stage===1?"DIG AND COLLECT EVERY FRUIT":
+         (stage===2?"COLLECT FRUIT + DEFEAT "+killGoal+" MONSTERS":
+                    "FRUIT + "+killGoal+" MONSTERS + FALLING ROCKS"),
+         FIELD_W/2, 62, 13,"#fff","center");
+  }
+  if(deathTimer>0){
+    text("OUCH!", FIELD_W/2, FIELD_H/2, 26,"#f44","center");
+  }
+  if(screenFlash>0){
+    ctx.fillStyle="rgba(255,255,255,"+(screenFlash/40)+")";
+    ctx.fillRect(0,0,FIELD_W,FIELD_H);
+  }
+  ctx.restore();
+}
+
+function panel(x,y,w,h,border){
+  ctx.fillStyle="#000"; ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle=border||"#fff"; ctx.lineWidth=4; ctx.strokeRect(x+2,y+2,w-4,h-4);
+  ctx.strokeStyle="#333"; ctx.lineWidth=2; ctx.strokeRect(x+8,y+8,w-16,h-16);
+}
+
+function drawStartScreen(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,cv.width,cv.height);
+  // decorative soil strip
+  for(let x=0;x<COLS;x++){
+    ctx.fillStyle=(x%2)?"#8a4a1c":"#a75c26";
+    ctx.fillRect(x*TS, cv.height-40, TS, 40);
+  }
+  drawSprite(SPR_PLAYER,PAL_PLAYER, 110, cv.height-104, 4);
+  drawSprite(SPR_ENEMY_A,PAL_A, 300, cv.height-104, 4);
+  drawSprite(SPR_ENEMY_B,PAL_B, 436, cv.height-104, 4);
+  text("UNDERGROUND", cv.width/2, 130, 44, (frame%30<15)?"#ffd21e":"#ff8a1f","center");
+  text("ADVENTURE",   cv.width/2, 182, 44, "#2ff0ff","center");
+  text("A RETRO DIGGING ARCADE GAME", cv.width/2, 220, 14,"#8f8","center");
+  if(playerName){
+    text("PLAYER  "+playerName, cv.width/2, 252, 18,"#8f8","center");
+    if(frame%40<26) text("PRESS ENTER TO PLAY", cv.width/2, 292, 24,"#fff","center");
+    text("N  -  CHANGE NAME      H  -  RANKING", cv.width/2, 330, 13,"#4cf","center");
+  } else {
+    if(frame%40<26) text("PRESS ENTER", cv.width/2, 290, 26,"#fff","center");
+    text("H  -  HIGH SCORE RANKING", cv.width/2, 330, 14,"#4cf","center");
+  }
+  text("ORIGINAL PIXEL ART & CODE - NO ROM ASSETS", cv.width/2, 362, 11,"#555","center");
+}
+
+function drawNameScreen(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,cv.width,cv.height);
+  panel(72,120,cv.width-144,300,"#ffd21e");
+  text("ENTER YOUR NAME", cv.width/2, 190, 26,"#ffd21e","center");
+  const shown = nameBuffer + ((frame%30<15)?"_":" ");
+  text(shown||"_", cv.width/2, 260, 34,"#fff","center");
+  text("(A-Z 0-9, MAX 8 CHARS - ASKED ONLY ONCE)", cv.width/2, 292, 12,"#888","center");
+  if(nameBuffer.length>0 && frame%40<26)
+    text("PRESS ENTER TO START", cv.width/2, 350, 20,"#8f8","center");
+  else if(nameBuffer.length===0)
+    text("TYPE YOUR NAME", cv.width/2, 350, 18,"#666","center");
+  drawSprite(SPR_PLAYER,PAL_PLAYER, cv.width/2-32, 380, 4);
+}
+
+function drawPause(){
+  ctx.fillStyle="rgba(0,0,0,0.72)"; ctx.fillRect(0,0,cv.width,cv.height);
+  panel(152,200,320,170,"#2ff0ff");
+  text("PAUSED", cv.width/2, 260, 32,"#2ff0ff","center");
+  text("PRESS P TO RESUME", cv.width/2, 300, 14,"#fff","center");
+  text("M : MUSIC "+(Audio8.isOn()?"ON":"OFF"), cv.width/2, 330, 13,"#888","center");
+}
+
+function drawClear(){
+  ctx.fillStyle="rgba(0,0,0,0.80)"; ctx.fillRect(0,0,cv.width,cv.height);
+  panel(52,160,cv.width-104,250,"#8f8");
+  text("STAGE CLEAR!", cv.width/2, 222, 36,(frame%20<10)?"#8f8":"#ffd21e","center");
+  text("SCORE "+pad(score,6), cv.width/2, 268, 22,"#fff","center");
+  if(clearBonusMsg) text(clearBonusMsg, cv.width/2, 296, 12,"#ffd21e","center");
+  text("FRUIT "+fruitGot+"/"+fruitTotal+"   KILLS "+matchKills+" (x500 = "+(matchKills*KILL_POINTS)+")",
+       cv.width/2, 326, 13,"#9ad","center");
+  if(frame%40<26) text("PRESS ENTER FOR NEXT STAGE", cv.width/2, 378, 18,"#fff","center");
+}
+
+/* RESULT SCREEN — shown after EVERY game:
+   this match's score/stats on top, the TOP 10 ranking underneath. */
+function drawOver(){
+  overTimer++;
+  ctx.fillStyle="rgba(0,0,0,0.90)"; ctx.fillRect(0,0,cv.width,cv.height);
+  panel(16,10,cv.width-32,cv.height-42,"#f44");
+
+  text("GAME OVER", cv.width/2, 56, 30,(frame%24<12)?"#f44":"#ff8a1f","center");
+
+  /* --- this match's result --- */
+  ctx.fillStyle="#1a0505"; ctx.fillRect(40,70,cv.width-80,74);
+  ctx.strokeStyle="#f44"; ctx.lineWidth=2; ctx.strokeRect(40,70,cv.width-80,74);
+  const gameNo = rankStats? rankStats.total : readHistory().length;
+  text("FINAL RESULT  -  "+(playerName||"PLAYER")+"  -  GAME #"+gameNo, cv.width/2, 90, 13,"#faa","center");
+  text(pad(score,6), cv.width/2, 122, 30,"#fff","center");
+  text("STAGE "+stage, 64, 138, 12,"#9ad");
+  text("KILLS "+matchKills+" (x500)", 170, 138, 12,"#9ad");
+  text("FRUIT "+matchFruit, 330, 138, 12,"#9ad");
+  text("TIME "+(rankStats?0:0, Math.max(0,Math.floor((Date.now()-matchStart)/1000)))+"s", 430, 138, 12,"#9ad");
+  text("HI "+pad(highScore,6), 512, 138, 12,"#ff3");
+
+  /* --- ranking over EVERY recorded match --- */
+  const totalTxt = rankStats? ("ALL "+rankStats.total+" MATCHES RECORDED") : "";
+  text("TOP 10 RANKING", cv.width/2, 170, 18,"#ffd21e","center");
+  if(totalTxt) text(totalTxt, cv.width/2, 186, 11,"#666","center");
+  if(rankLoading){
+    text("SAVING & LOADING RANKING"+".".repeat(Math.floor(frame/14)%4), cv.width/2, 300, 15,"#888","center");
+  } else if(rankList.length===0){
+    text("NO RECORDS YET", cv.width/2, 300, 16,"#666","center");
+  } else {
+    text("RANK NAME        SCORE   ST KILL FRT", cv.width/2, 204, 12,"#4a8","center");
+    const rows=Math.min(10, rankList.length);
+    for(let i=0;i<rows;i++){
+      const r=rankList[i], y=226+i*24;
+      const mine = r.ts===lastRecordId;
+      const col = mine ? ((frame%14<7)?"#ffd21e":"#fff") : (i===0?"#2ff0ff":"#9ad");
+      if(mine){
+        ctx.fillStyle="#3a2200"; ctx.fillRect(38,y-16,cv.width-76,22);
+        ctx.strokeStyle="#ffd21e"; ctx.lineWidth=2; ctx.strokeRect(38,y-16,cv.width-76,22);
+        ctx.fillStyle=(frame%14<7)?"#ffd21e":"#ff8a1f";
+        ctx.fillRect(30,y-11,5,12); ctx.fillRect(cv.width-35,y-11,5,12);
+      }
+      text(pad(i+1,2)+".", 52, y, 14, col);
+      text((r.name||"???").slice(0,8), 96, y, 14, col);
+      text(pad(r.score,6), 268, y, 14, col);
+      text(pad(r.stage||1,2), 392, y, 12, col);
+      text(pad(r.kills||0,2), 452, y, 12, col);
+      text(pad(r.fruit||0,2), 512, y, 12, col);
+    }
+    // where THIS match placed among every recorded game
+    const msgY = 226+rows*24+18;
+    const ord = (n)=>{ const s=["TH","ST","ND","RD"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); };
+    if(myRank>0 && myRank<=10){
+      text("NEW RANK  "+ord(myRank)+" PLACE!", cv.width/2, msgY, 17,
+           (frame%16<8)?"#ffd21e":"#8f8","center");
+    } else if(myRank>0){
+      text("RANKED "+ord(myRank)+" OF "+rankStats.total+" MATCHES", cv.width/2, msgY, 14,"#9ad","center");
+    }
+    if(rankStats){
+      text("YOUR GAMES "+rankStats.myGames+"    YOUR BEST "+pad(rankStats.myBest,6)+
+           "    AVERAGE "+pad(rankStats.avg,6), cv.width/2, msgY+20, 11,"#4a8","center");
+    }
+  }
+
+  if(frame%40<26) text("PRESS ENTER TO PLAY AGAIN", cv.width/2, cv.height-46, 17,"#fff","center");
+  text("N - CHANGE NAME     ESC - TITLE", cv.width/2, cv.height-26, 12,"#4cf","center");
+}
+
+function drawHigh(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,cv.width,cv.height);
+  panel(28,28,cv.width-56,cv.height-70,"#2ff0ff");
+  text("HIGH SCORE  -  TOP 10", cv.width/2, 84, 28,"#ffd21e","center");
+  text((FB.ready?"( FIREBASE ONLINE )":"( LOCAL RANKING )")+
+       "   ALL "+allRecords.length+" MATCHES RECORDED", cv.width/2, 106, 11,"#666","center");
+  text("RANK  NAME        SCORE   ST  KILL  FRUIT", cv.width/2, 132, 13,"#4a8","center");
+  if(rankLoading){ text("LOADING...", cv.width/2, 280, 20,"#fff","center"); }
+  else if(rankList.length===0){ text("NO RECORDS YET", cv.width/2, 280, 18,"#666","center"); }
+  else {
+    rankList.slice(0,10).forEach((r,i)=>{
+      const y=168+i*34;
+      const mine = (r.ts && r.ts===lastRecordId);
+      const col = mine ? ((frame%16<8)?"#ffd21e":"#fff") : (i===0?"#2ff0ff":"#9ad");
+      if(mine){
+        ctx.fillStyle="#3a2200"; ctx.fillRect(48,y-21,cv.width-96,30);
+        ctx.strokeStyle="#ffd21e"; ctx.lineWidth=3; ctx.strokeRect(48,y-21,cv.width-96,30);
+        ctx.fillStyle=(frame%16<8)?"#ffd21e":"#ff8a1f";
+        ctx.fillRect(40,y-14,5,16); ctx.fillRect(cv.width-45,y-14,5,16);
+      }
+      text(pad(i+1,2)+".", 62, y, 18, col);
+      text((r.name||"???").slice(0,8), 110, y, 18, col);
+      text(pad(r.score,6), 268, y, 18, col);
+      text(pad(r.stage||1,2), 392, y, 15, col);
+      text(pad(r.kills||0,2), 448, y, 15, col);
+      text(pad(r.fruit||0,2), 520, y, 15, col);
+    });
+  }
+  if(frame%40<26) text("ENTER - PLAY AGAIN      ESC / H - BACK", cv.width/2, cv.height-22, 15,"#fff","center");
+}
+
+function render(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,cv.width,cv.height);
+  if(state===S_START){ drawStartScreen(); return; }
+  if(state===S_NAME){ drawNameScreen(); return; }
+  if(state===S_HIGH){ drawHigh(); return; }
+  // in-game rendering
+  drawHUD();
+  drawField();
+  // bottom strip
+  const P=PAL();
+  ctx.fillStyle=P.border; ctx.fillRect(0,FIELD_Y+FIELD_H,cv.width,cv.height-(FIELD_Y+FIELD_H));
+  ctx.fillStyle="#000";
+  const strip = alertPhase ? "CHEESE ALERT!"
+              : cheeseEaten ? "CAVERN SHIFTED"
+              : nest.cheese ? "THE MACHINE BECAME CHEESE - SNATCH IT!"
+              : machine.active ? "MONSTER MACHINE RUNNING "+machine.made+"/"+machine.total
+              : "DIG! COLLECT! SURVIVE!";
+  text(playerName+"   "+strip, 10, cv.height-9, 14, "#000");
+  if(state===S_PAUSE) drawPause();
+  if(state===S_CLEAR) drawClear();
+  if(state===S_OVER) drawOver();
+}
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+function loop(){
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+// initialise a dummy map so the renderer never crashes before the game starts
+generateStage(1);
+state=S_START;
+loadAllRecords();          // know the full match history from the very start
+loop();
+</script>
+</body>
+</html>
